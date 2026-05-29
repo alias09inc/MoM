@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from itertools import chain
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -84,7 +86,7 @@ def preprocess(
     streaming: bool = False,
     max_tokens: Optional[int] = None,
     shuffle_buffer_size: int = 10_000,
-    generator_cache_dir: Optional[str] = None,
+    shard_size: int = 8192,
     legacy_output_path: bool = False,
     text_column: str = 'text'
 ) -> None:
@@ -121,9 +123,8 @@ def preprocess(
             `seq_len` chunks, so the final count is rounded down to a multiple of `seq_len`.
         shuffle_buffer_size:
             Buffer size for streaming shuffle. Set to 0 to disable.
-        generator_cache_dir:
-            Cache directory used by `Dataset.from_generator`. Defaults to
-            `<output>.generator_cache` in streaming mode.
+        shard_size:
+            Number of fixed-length samples per saved shard in streaming mode.
         legacy_output_path:
             Save to `output/dataset/name/split` for compatibility with the original script.
         text_column:
@@ -159,7 +160,7 @@ def preprocess(
             ctx_len=ctx_len,
             max_tokens=max_tokens,
             shuffle_buffer_size=shuffle_buffer_size,
-            generator_cache_dir=generator_cache_dir,
+            shard_size=shard_size,
             text_column=text_column
         )
         return
@@ -196,7 +197,7 @@ def preprocess_streaming(
     ctx_len: Optional[int],
     max_tokens: Optional[int],
     shuffle_buffer_size: int,
-    generator_cache_dir: Optional[str],
+    shard_size: int,
     text_column: str
 ) -> None:
     """
@@ -207,6 +208,8 @@ def preprocess_streaming(
     """
     if max_tokens is not None and max_tokens < seq_len:
         raise ValueError(f'max_tokens ({max_tokens}) must be at least seq_len ({seq_len})')
+    if shard_size <= 0:
+        raise ValueError(f'shard_size ({shard_size}) must be positive')
 
     target_tokens = None if max_tokens is None else (max_tokens // seq_len) * seq_len
     if max_tokens is not None and target_tokens != max_tokens:
@@ -221,27 +224,78 @@ def preprocess_streaming(
         logger.info(f'Shuffling streaming dataset with seed={seed}, buffer_size={shuffle_buffer_size}')
         stream = stream.shuffle(seed=seed, buffer_size=shuffle_buffer_size)
 
-    if generator_cache_dir is None:
-        generator_cache_dir = f'{output}.generator_cache'
+    output_path = Path(output)
+    output_path.mkdir(parents=True, exist_ok=True)
+    existing_shards = sorted(path for path in output_path.glob('shard_*') if path.is_dir())
+    metadata_path = output_path / 'shards_metadata.json'
+    if existing_shards or metadata_path.exists():
+        raise FileExistsError(
+            f'{output} already contains sharded preprocessing output. '
+            'Use a new --output directory or remove the existing shards first.'
+        )
 
-    features = Features({'input_ids': Sequence(Value('int32'))})
-    logger.info(f'Stream-tokenizing with generator cache {generator_cache_dir}')
-    tokenized = Dataset.from_generator(
-        lambda: iter_streaming_chunks(
-            stream=stream,
-            tokenizer=tokenizer,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            ctx_len=ctx_len,
-            target_tokens=target_tokens,
-            text_column=text_column
-        ),
-        features=features,
-        cache_dir=generator_cache_dir
+    features = Features({'input_ids': Sequence(Value('int32'), length=seq_len)})
+    chunks = iter_streaming_chunks(
+        stream=stream,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        ctx_len=ctx_len,
+        target_tokens=target_tokens,
+        text_column=text_column
     )
-    logger.info(f'Generated dataset: {tokenized}')
-    logger.info(f'Saving processed dataset to {output}')
-    tokenized.save_to_disk(output)
+    total_samples = write_sharded_dataset(
+        chunks=chunks,
+        output=output_path,
+        features=features,
+        shard_size=shard_size
+    )
+    metadata = {
+        'format': 'sharded_hf_dataset',
+        'dataset': dataset,
+        'name': name,
+        'split': split,
+        'seq_len': seq_len,
+        'max_tokens': max_tokens,
+        'saved_tokens': total_samples * seq_len,
+        'num_samples': total_samples,
+        'shard_size': shard_size,
+        'text_column': text_column
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + '\n')
+    logger.info(f'Saved {total_samples} samples / {total_samples * seq_len} tokens to {output}')
+    logger.info(f'Wrote shard metadata to {metadata_path}')
+
+
+def write_sharded_dataset(
+    chunks: Iterator[Dict[str, List[int]]],
+    output: Path,
+    features: Features,
+    shard_size: int
+) -> int:
+    rows: List[List[int]] = []
+    total_samples = 0
+    shard_id = 0
+
+    def flush() -> None:
+        nonlocal rows, total_samples, shard_id
+        if not rows:
+            return
+
+        shard_path = output / f'shard_{shard_id:06d}'
+        logger.info(f'Saving shard {shard_id:06d} with {len(rows)} samples to {shard_path}')
+        Dataset.from_dict({'input_ids': rows}, features=features).save_to_disk(str(shard_path))
+        total_samples += len(rows)
+        shard_id += 1
+        rows = []
+
+    for chunk in chunks:
+        rows.append(chunk['input_ids'])
+        if len(rows) >= shard_size:
+            flush()
+
+    flush()
+    return total_samples
 
 
 def iter_streaming_chunks(
@@ -304,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument("--streaming", action="store_true", help="Stream the dataset and stop at --max_tokens")
     parser.add_argument("--max_tokens", type=int, default=None, help="Maximum number of tokens to save")
     parser.add_argument("--shuffle_buffer_size", type=int, default=10_000, help="Streaming shuffle buffer size; 0 disables shuffle")
-    parser.add_argument("--generator_cache_dir", default=None, help="Cache directory for Dataset.from_generator")
+    parser.add_argument("--shard_size", type=int, default=8192, help="Number of fixed-length samples per saved shard in streaming mode")
     parser.add_argument("--legacy_output_path", action="store_true", help="Save to output/dataset/name/split like the original script")
     parser.add_argument("--text_column", default="text", help="Text column to tokenize")
     args = parser.parse_args()
@@ -324,7 +378,7 @@ if __name__ == "__main__":
         streaming=args.streaming,
         max_tokens=args.max_tokens,
         shuffle_buffer_size=args.shuffle_buffer_size,
-        generator_cache_dir=args.generator_cache_dir,
+        shard_size=args.shard_size,
         legacy_output_path=args.legacy_output_path,
         text_column=args.text_column
     )

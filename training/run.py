@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
-from datasets import load_from_disk
+from pathlib import Path
+
+from datasets import concatenate_datasets, load_from_disk
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           Trainer, set_seed)
 
@@ -17,6 +19,17 @@ import wandb
 from torchinfo import summary
 
 logger = get_logger(__name__)
+
+
+def load_training_dataset(cache_dir: str):
+    cache_path = Path(cache_dir)
+    shard_paths = sorted(path for path in cache_path.glob("shard_*") if path.is_dir())
+    if not shard_paths:
+        return load_from_disk(cache_dir)
+
+    logger.info(f"Detected {len(shard_paths)} dataset shards under {cache_dir}")
+    shards = [load_from_disk(str(path)) for path in shard_paths]
+    return concatenate_datasets(shards)
 
 
 def main():
@@ -55,7 +68,7 @@ def main():
     logger.info(f"{tokenizer}\n{model}\n{model.config}")
 
     logger.info(f"Loading the `{args.split}` split directly from the cache {args.cache_dir}...")
-    dataset = load_from_disk(args.cache_dir)
+    dataset = load_training_dataset(args.cache_dir)
     logger.info(f"{dataset}")
     logger.info(f"Shuffling the dataset with seed {args.seed}")
     dataset = dataset.shuffle(seed=args.seed)
