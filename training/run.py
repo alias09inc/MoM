@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from pathlib import Path
+import importlib.util
 
 from datasets import concatenate_datasets, load_from_disk
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
@@ -10,7 +11,37 @@ import sys
 import os
 import torch
 from torch import nn
-# import mom
+
+
+def load_local_mom_package():
+    package_root = Path(__file__).resolve().parents[1] / "mom_naive"
+    spec = importlib.util.spec_from_file_location(
+        "mom",
+        package_root / "__init__.py",
+        submodule_search_locations=[str(package_root)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["mom"] = module
+    spec.loader.exec_module(module)
+
+    from mom.models.mom_gated_deltanet import MomGatedDeltaNetForCausalLM
+
+    MomGatedDeltaNetForCausalLM._tied_weights_keys = {
+        "lm_head.weight": "model.embeddings.weight",
+    }
+
+    import mom.layers.mom_gated_deltanet as mom_gated_deltanet
+
+    chunk_gated_delta_rule = mom_gated_deltanet.chunk_gated_delta_rule
+
+    def chunk_gated_delta_rule_compat(*args, **kwargs):
+        kwargs.pop("head_first", None)
+        return chunk_gated_delta_rule(*args, **kwargs)
+
+    mom_gated_deltanet.chunk_gated_delta_rule = chunk_gated_delta_rule_compat
+
+
+load_local_mom_package()
 import fla
 from flame.data import DataCollatorForLanguageModeling
 from flame.logging import LogCallback, get_logger
@@ -88,7 +119,7 @@ def main():
     trainer = Trainer(
         model=model,
         args=args,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=data_collator,
         callbacks=[LogCallback()],
         train_dataset=dataset

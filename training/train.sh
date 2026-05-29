@@ -4,7 +4,7 @@ for arg in $args; do
 done
 
 echo "model:            ${model:=fla-hub/gla-1.3B-100B}"
-echo "tokenizer:        ${tokenizer:=fla-hub/gla-1.3B-100B}"
+echo "tokenizer:        ${tokenizer:=mistralai/Mistral-7B-v0.1}"
 echo "project:          ${project:=fla}"
 echo "type:             ${type:=gla}"
 echo "data:             ${data:=}"
@@ -52,7 +52,6 @@ params="--model_name_or_path $model \
     --dataloader_num_workers $workers \
     --dataloader_prefetch_factor $prefetch \
     --output_dir $path \
-    --overwrite_output_dir \
     --logging_steps $logging \
     --include_num_input_tokens_seen \
     --save_steps $save \
@@ -177,7 +176,8 @@ mkdir -p $path
 cp * $path
 cp -r configs $path
 cp -r flame   $path
-cp -r ../fla $path
+fla_src=$(python -c 'import pathlib, fla; print(pathlib.Path(fla.__file__).resolve().parent)')
+cp -r "$fla_src" "$path"
 
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
